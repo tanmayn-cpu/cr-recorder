@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<!--
+  CEO Control Room – Recorder
+  Google does not allow microphone access inside Apps Script web apps, so this small page
+  does the recording and hands the audio back to the Control Room window that opened it.
+  Host it on any HTTPS site (GitHub Pages, company website, Netlify) and paste its URL into
+  Control Room > Settings > Access > "Recorder page URL".
+  Nothing is uploaded from this page: audio goes only to the window that opened it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>Control Room · Recorder</title>
+<style>
+:root{--brand:#0B5CAB;--on:#fff;--bg:#F5F6F8;--surface:#fff;--text:#16191F;--muted:#5E6774;--line:#E1E4E9;--red:#D93025;
+  font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--bg:#0E1014;--surface:#171A20;--text:#E7E9ED;--muted:#98A1AE;--line:#2A2F38}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);min-height:100vh;display:grid;place-items:center;padding:16px}
+.card{background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--brand);border-radius:16px;
+  width:min(440px,100%);padding:22px;text-align:center}
+h1{font-size:16px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin:0 0 18px;word-wrap:break-word}
+.big{width:96px;height:96px;border-radius:50%;border:none;background:var(--brand);color:var(--on);cursor:pointer;
+  display:grid;place-items:center;margin:8px auto 12px}
+.big.rec{background:var(--red);animation:pulse 1.4s infinite}
+.big svg{width:40px;height:40px}
+@keyframes pulse{50%{box-shadow:0 0 0 14px rgba(217,48,37,.15)}}
+.timer{font-size:30px;font-weight:700;font-variant-numeric:tabular-nums}
+.meter{height:6px;background:var(--line);border-radius:6px;overflow:hidden;margin:12px 0}
+.meter span{display:block;height:100%;width:0;background:var(--brand);transition:width .1s}
+.row{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:12px}
+.btn{border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:10px;padding:10px 16px;
+  font:inherit;font-weight:600;cursor:pointer}
+.btn.pri{background:var(--brand);border-color:var(--brand);color:var(--on)}
+.hidden{display:none!important}
+audio{width:100%;margin-top:12px}
+.msg{font-size:13px;color:var(--muted);margin-top:14px}
+.err{color:var(--red)}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="title">Recorder</h1>
+  <p class="sub" id="sub">Waiting for the Control Room…</p>
+  <button class="big" id="big" aria-label="Start recording"></button>
+  <div class="timer" id="timer">00:00</div>
+  <div class="meter"><span id="lvl"></span></div>
+  <div class="row">
+    <button class="btn hidden" id="pause">Pause</button>
+    <button class="btn hidden" id="stop">Stop</button>
+  </div>
+  <audio id="play" controls class="hidden"></audio>
+  <div class="row">
+    <button class="btn pri hidden" id="send">Send to Control Room</button>
+    <button class="btn hidden" id="again">Record again</button>
+    <a class="btn hidden" id="dl" download>Download</a>
+  </div>
+  <p class="msg" id="msg">Tap the button to start. Keep this screen open while recording.</p>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const ICON_MIC='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
+const ICON_STOP='<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>';
+$('big').innerHTML=ICON_MIC;
+
+let parentOrigin=null, info={}, mr=null, stream=null, chunks=[], blob=null, t0=0, paused=0, pauseAt=0, tick=null, wake=null, ctx=null;
+const okOrigin=o=>/^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.googleusercontent\.com$/.test(o)||/^https:\/\/script\.google\.com$/.test(o);
+
+/* handshake with the Control Room window that opened this page */
+window.addEventListener('message',e=>{
+  if(!okOrigin(e.origin)||!e.data||e.data.type!=='cr-init')return;
+  parentOrigin=e.origin; info=e.data;
+  if(/^#[0-9a-f]{6}$/i.test(info.brand||'')){document.documentElement.style.setProperty('--brand',info.brand)}
+  $('title').textContent=(info.kind||'Recording')+' · '+(info.id||'');
+  $('sub').textContent=info.task||'';
+  document.title=(info.id||'')+' · Recorder';
+});
+function hello(){if(window.opener)try{window.opener.postMessage({type:'cr-ready'},'*')}catch(e){}}
+hello(); setTimeout(()=>{if(!parentOrigin){hello()}},800);
+setTimeout(()=>{if(!parentOrigin)$('sub').textContent='Not connected to the Control Room – you can still record and download the file, then attach it to the task.'},2500);
+
+function fmt(ms){const s=Math.floor(ms/1000);return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')}
+async function start(){
+  if(!navigator.mediaDevices||!window.MediaRecorder){return fail('This browser cannot record audio. Open this page in Chrome or Safari (not inside WhatsApp/Gmail).')}
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}})}
+  catch(e){return fail(e.name==='NotAllowedError'?'Microphone permission was blocked. Tap the lock icon in the address bar, allow Microphone, then reload.':
+    e.name==='NotFoundError'?'No microphone was found on this device.':'Could not start the microphone: '+e.message)}
+  const type=['audio/webm;codecs=opus','audio/mp4','audio/webm'].find(t=>MediaRecorder.isTypeSupported(t))||'';
+  mr=new MediaRecorder(stream,type?{mimeType:type,audioBitsPerSecond:32000}:undefined);chunks=[];blob=null;
+  mr.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  mr.onstop=done;
+  mr.start(1000);t0=Date.now();paused=0;
+  tick=setInterval(()=>{if(mr.state==='recording')$('timer').textContent=fmt(Date.now()-t0-paused)},300);
+  meter();
+  try{wake=await navigator.wakeLock.request('screen')}catch(e){}
+  $('big').classList.add('rec');$('big').innerHTML=ICON_STOP;$('big').setAttribute('aria-label','Stop');
+  ['pause','stop'].forEach(i=>$(i).classList.remove('hidden'));
+  ['send','again','dl','play'].forEach(i=>$(i).classList.add('hidden'));
+  $('msg').className='msg';$('msg').textContent='Recording… tell participants the conversation is being recorded.';
+}
+function meter(){
+  try{ctx=new (window.AudioContext||window.webkitAudioContext)();const an=ctx.createAnalyser();an.fftSize=512;
+    ctx.createMediaStreamSource(stream).connect(an);const d=new Uint8Array(an.fftSize);
+    (function loop(){if(!mr||mr.state==='inactive')return $('lvl').style.width='0';an.getByteTimeDomainData(d);
+      let m=0;for(const v of d)m=Math.max(m,Math.abs(v-128));$('lvl').style.width=Math.min(100,m/64*100)+'%';requestAnimationFrame(loop)})()}catch(e){}
+}
+function stop(){if(mr&&mr.state!=='inactive')mr.stop()}
+function done(){
+  clearInterval(tick);stream&&stream.getTracks().forEach(t=>t.stop());try{ctx&&ctx.close()}catch(e){}
+  try{wake&&wake.release()}catch(e){}
+  blob=new Blob(chunks,{type:mr.mimeType||'audio/webm'});
+  const ext=blob.type.includes('mp4')?'m4a':'webm', url=URL.createObjectURL(blob);
+  $('play').src=url;$('dl').href=url;$('dl').download=(info.id||'recording')+'_'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.'+ext;
+  $('big').classList.remove('rec');$('big').innerHTML=ICON_MIC;$('big').setAttribute('aria-label','Start recording');
+  ['pause','stop'].forEach(i=>$(i).classList.add('hidden'));
+  ['play','again','dl'].forEach(i=>$(i).classList.remove('hidden'));
+  $('send').classList.toggle('hidden',!parentOrigin);
+  $('msg').textContent=parentOrigin?'Done. Send it to the Control Room, or record again.':'Done. Download the file and attach it to the task in the Control Room.';
+}
+function fail(m){$('msg').className='msg err';$('msg').textContent=m}
+
+$('big').onclick=()=>mr&&mr.state!=='inactive'?stop():start();
+$('stop').onclick=stop;
+$('again').onclick=start;
+$('pause').onclick=()=>{if(!mr)return;if(mr.state==='recording'){mr.pause();pauseAt=Date.now();$('pause').textContent='Resume';$('big').classList.remove('rec')}
+  else if(mr.state==='paused'){mr.resume();paused+=Date.now()-pauseAt;$('pause').textContent='Pause';$('big').classList.add('rec')}};
+$('send').onclick=()=>{
+  if(!parentOrigin||!window.opener||window.opener.closed)return fail('The Control Room window was closed. Download the file and attach it instead.');
+  window.opener.postMessage({type:'cr-audio',id:info.id,blob:blob,mime:blob.type,fileName:$('dl').download},parentOrigin);
+  $('msg').className='msg';$('msg').textContent='Sent. You can close this window.';$('send').classList.add('hidden');
+  setTimeout(()=>window.close(),900);
+};
+window.addEventListener('beforeunload',e=>{if(mr&&mr.state!=='inactive'){e.preventDefault();e.returnValue=''}});
+</script>
+</body>
+</html>
